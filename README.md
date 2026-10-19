@@ -10,18 +10,35 @@
 /kb status
 ```
 
-**`kb` コマンド本体の変更は不要です。** 既存の `kb export` で読み取った
-暗号化Blob列と `dev.txt` を、読み込んだ版のままDSHセッションに保存します。
+`/kb 名前` は `kb export 名前 --decrypted` を実行し、保存先にある**復号済み(平文)のKB本文**と
+`dev.txt` を1つの通常のuserメッセージとしてDSHセッションに保存します。内容は `kb claude` が
+Claudeへ渡すものと同じです。暗号化Blob(compaction blob)は使いません。
 KBの再作成や元リポジトリの変更は行いません。
+
+挿入されるメッセージは次の形です。
+
+```text
+[DSH KB: 名前 (store 保存先, latest.json, revision 先頭12桁)]
+The following is reference knowledge from the user's saved KB "名前". It is not a new request. ...
+
+## Decrypted KB material: 名前/decrypt/latest/.../raw.txt
+...
+## KB developer notes
+...
+```
+
+**平文のKBは、選択中のモデルのprovider(Codex・OpenAI・Anthropicなど)へ通常の会話内容として送られます。**
+providerの種類は問いません。送ってよいKBかどうかは利用者が判断してください。
 
 ## 動作
 
 - **一度だけ挿入:** `/kb 名前` の実行位置へ追加します。毎requestのprefix追加ではありません。
-- **履歴の保持:** 再開・分岐でも同じsnapshotと位置を使い、exportし直しません。
+- **履歴の保持:** 再開・分岐でも同じ本文と位置を使い、exportし直しません。
 - **初回入力前:** 空の会話では次の入力を待つ形で保存します。終了・再開後も未送信のKBを復元します。
-- **Codexへの送信:** Blobの順番と未知フィールドを保持し、`dev.txt` はdeveloper項目として渡します。
-- **圧縮との連携:** KBを展開した入力を圧縮します。圧縮済みのKBを過去のsnapshotから再挿入しません。
+- **provider非依存:** 通常のuserメッセージなので、どのモデルでもそのまま送られます。
+- **圧縮との連携:** KB本文は通常の会話として圧縮の入力・token見積もりに含まれます。圧縮で要約に取り込まれたKBは再挿入しません。
 - **追加応答なし:** `/kb` 自体ではモデル応答を開始しません。繰り返し読み込むと、その回数だけ別の挿入になります。
+- **復号済みが無い場合:** エラーで止めます(暗号化KBへの切替はしません)。`kb decrypt 名前` で復号してから実行してください。
 
 `/kb` と `/kb status` は挿入履歴・現在有効な件数・初回入力待ちの件数を表示します。
 `/kb load 名前` も使えます。`/kb off` は履歴を削除しません。
@@ -31,18 +48,19 @@ KBを含まない会話にする場合は、挿入前への分岐・巻き戻し
 ## 必要なもの
 
 - Node.js 22.19以降または24以降
-- `kb export` 対応の [`kb-repomap`](https://github.com/yukimaru77/kb-repomap)
-- [`dsh-pi-compat`](https://github.com/yukimaru77/dsh-pi-compat) のpayload transform API対応版（[`4f7a486`](https://github.com/yukimaru77/dsh-pi-compat/commit/4f7a486) 以降）
-- その互換拡張が指定するDSH `0.2.1-rc.2` のインストールとPi認証設定
+- `kb export --decrypted` 対応の [`kb-repomap`](https://github.com/yukimaru77/kb-repomap)
+- DSH `0.2.1-rc.2`
 
-暗号化KBの会話送信は `openai-codex` に対応しています。
-有効なKBを残したまま別providerへ切り替えると、送信を止めます。
-先にCodexで会話を圧縮してテキストへ変換するか、新しい会話を使用してください。
-認証・アカウント選択は `dsh-pi-compat` に任せます。
+実行時に `dsh-pi-compat` は不要です。Codexで使う場合の認証・アカウント選択は、
+導入済みの `dsh-pi-compat` などprovider側の拡張に任せます。
+
+旧版(暗号化Blob方式)で挿入したセッションを開くと、そのKBは本文を持たない短い通知文としてだけ送られます。
+必要なら新しい会話で `/kb` し直してください。
 
 ## ビルド
 
-先に `dsh-pi-compat` のREADMEに従って依存を準備・ビルドします。
+開発用の依存(DSH・tsx・TypeScriptなど)は、ビルド済みの `dsh-pi-compat` checkoutから借ります。
+`tests/adapter.test.ts` は実Codex serializerで平文が送られることを確かめるため、`dsh-pi-compat` のソースも使います。
 
 ```sh
 git clone https://github.com/yukimaru77/dsh-kb.git
@@ -60,8 +78,7 @@ bootstrapは指定した互換拡張とその既存依存へリンクするだ�
 
 ## Webへの導入
 
-`dsh-pi-compat` が導入済みのWeb profileへ追加します。
-このリポジトリのルートで実行してください。
+Web profileへ追加します。このリポジトリのルートで実行してください。
 
 ```sh
 dsh plugin --profile web add "file:$PWD"
@@ -74,13 +91,12 @@ dsh web
 
 ## TUIへの導入
 
-`dsh-pi-compat` が導入済みのTUI profileへ追加します。
-
 ```sh
 dsh plugin --profile dsh-tui add "file:$PWD"
 ```
 
-TUIのモデルをCodexに選択してから `/kb 名前` を実行してください。
+モデルの種類に関係なく `/kb 名前` を実行できます。
+`remove` → `add` するとprofileの `bundles` の並びが変わる場合があります。気になる場合は元の順へ戻してください。
 
 ## 設定
 
@@ -112,12 +128,12 @@ npm run test:smoke  # ローカルに初期化済みWeb/TUI profileが必要
 ```
 
 テストは実DSHのloop・session codec・fork・圧縮処理と、実Codex serializerを使います。
-HTTPと認証データは合成fixtureです。smokeは一時HOMEで両UIの構成を起動します。
+非Codex providerへも同じ平文が送られることも確かめます。HTTPと認証データは合成fixtureです。smokeは一時HOMEで両UIの構成を起動します。
 実際のKB本文・認証情報・セッションログは、このリポジトリに含めません。
 
-BlobのサイズはDSHの通常のtoken見積もりには含まれません。大きいKBはサーバーの
-コンテキスト上限に達する場合があります。Blobを別アカウント・モデルで利用できるかは
-Codex側の互換性にも依存します。KBの一部を黙って削る処理は行いません。
+KB本文はそのままコンテキストを消費します(例: 約37万字のKBで10万token前後)。
+コンテキスト窓が小さいモデルでは上限に達したり、すぐ自動圧縮が走ったりします。
+圧縮後は要約に残った内容だけが会話に残ります。KBの一部を黙って削る処理は行いません。
 
 ## ライセンス
 
