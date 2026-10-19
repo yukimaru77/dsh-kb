@@ -1,0 +1,9 @@
+node_modules/
+lib/
+cordis.patch.yml
+.env
+.env.*
+*.local.yml
+*.log
+.DS_Store
+test-artifacts/

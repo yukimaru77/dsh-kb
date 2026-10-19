@@ -1,0 +1,29 @@
+{
+  "name": "dsh-kb",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Insert saved KB snapshots into DeepSeek Harness conversations with Codex",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/yukimaru77/dsh-kb.git" },
+  "engines": { "node": ">=24" },
+  "exports": { ".": { "types": "./src/index.ts", "default": "./lib/index.js" } },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "scripts": {
+    "bootstrap": "node scripts/bootstrap.mjs",
+    "build": "node --import tsx scripts/build.ts",
+    "typecheck": "node node_modules/typescript/bin/tsc --noEmit",
+    "test": "node --import tsx --test --test-timeout=20000 tests/*.test.ts",
+    "test:smoke": "node --import tsx scripts/smoke.ts"
+  },
+  "peerDependencies": {
+    "dsh-pi-compat": "0.1.0-local",
+    "@deepseek-ai/cordis": "4.0.5",
+    "@deepseek-ai/dsh-commands": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-agent": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-llm": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-session": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "0.2.1-rc.2",
+    "@deepseek-ai/schemastery": "3.18.5"
+  }
+}
