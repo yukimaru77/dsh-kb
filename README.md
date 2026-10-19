@@ -30,10 +30,10 @@ KBを含まない会話にする場合は、挿入前への分岐・巻き戻し
 
 ## 必要なもの
 
-- Node.js 24以降
+- Node.js 22.19以降または24以降
 - `kb export` 対応の [`kb-repomap`](https://github.com/yukimaru77/kb-repomap)
 - [`dsh-pi-compat`](https://github.com/yukimaru77/dsh-pi-compat) のpayload transform API対応版（[`4f7a486`](https://github.com/yukimaru77/dsh-pi-compat/commit/4f7a486) 以降）
-- その互換拡張が指定するDSH `0.2.1-rc.2` のソースビルドとPi認証設定
+- その互換拡張が指定するDSH `0.2.1-rc.2` のインストールとPi認証設定
 
 暗号化KBの会話送信は `openai-codex` に対応しています。
 有効なKBを残したまま別providerへ切り替えると、送信を止めます。
@@ -55,7 +55,7 @@ npm run build
 
 bootstrapは指定した互換拡張とその既存依存へリンクするだけです。
 ネットワークからの自動インストールやPi/DSH設定の変更はしません。
-生成された `cordis.patch.yml` はこのcheckoutの絶対パスを使うので、移動後は再ビルドしてください。
+生成される `cordis.patch.yml` はパッケージ名 `dsh-kb` で拡張を参照するので、checkoutの場所には依存しません。
 現時点ではGitHub上の開発用ソース公開で、npm公開はしていません。
 
 ## Webへの導入
@@ -64,22 +64,20 @@ bootstrapは指定した互換拡張とその既存依存へリンクするだ�
 このリポジトリのルートで実行してください。
 
 ```sh
-dsh plugin --profile web add "link:$PWD" -w --config.auto-install-peers=false
+dsh plugin --profile web add "file:$PWD"
 dsh web
 ```
 
 互換拡張のprivate provider overlayを使っている場合は、従来どおり `--patch` で指定してください。
+`file:` は導入時点のビルドをコピーするので、再ビルド後は `remove` してから `add` し直します。
 動いているWebサーバーへ反映するには、作業が終わってから再起動します。
 
 ## TUIへの導入
 
-互換拡張のoverlayに、この拡張のoverlayを追加します。
+`dsh-pi-compat` が導入済みのTUI profileへ追加します。
 
 ```sh
-dsh --profile dsh-tui \
-  --patch /path/to/dsh-pi-compat/cordis.patch.yml \
-  --patch /path/to/dsh-pi-compat/cordis.tui.patch.yml \
-  --patch /path/to/dsh-kb/cordis.patch.yml
+dsh plugin --profile dsh-tui add "file:$PWD"
 ```
 
 TUIのモデルをCodexに選択してから `/kb 名前` を実行してください。
