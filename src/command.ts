@@ -1,25 +1,15 @@
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import type { CommandInvocation, CommandResult } from '@deepseek-ai/dsh-commands';
-import type { LlmCallConfig, RequestMessage } from '@deepseek-ai/dsh-llm';
+import type { RequestMessage } from '@deepseek-ai/dsh-llm';
 import { SessionSeq, type Session } from '@deepseek-ai/dsh-session';
 import { createInsertion, insertions, parseCommand, validateSnapshot } from './core.ts';
 import { KbCommandError, type KbExecutor } from './execute.ts';
 import { pendingInsertions, queuePersistentInsertion } from './pending.ts';
 
 export interface KbHost {
-  routeFor(agent: Agent, signal?: AbortSignal): Partial<LlmCallConfig> | Promise<Partial<LlmCallConfig>>;
-  supportsModel(id: string): boolean;
   flush(session: Session): Promise<unknown>;
 }
 const USAGE = '/kb 名前 [--store 保存先] [--file ファイル名] · /kb list · /kb status';
-
-async function assertCodex(host: KbHost, agent: Agent, signal: AbortSignal): Promise<Partial<LlmCallConfig>> {
-  const route = await host.routeFor(agent, signal);
-  if (route.provider !== 'openai-codex' || !route.model || !host.supportsModel(route.model)) {
-    throw new KbCommandError('暗号化KBにはCodexモデルを選択してください。');
-  }
-  return route;
-}
 
 /** Report admitted insertions, including ones consumed by compaction, plus fresh-session pending entries. */
 function history(agent: Agent): RequestMessage[] {
@@ -57,7 +47,6 @@ export function createKbHandler(host: KbHost, execute: KbExecutor) {
         entered = true;
         const combined = AbortSignal.any([signal, maintenanceSignal]);
         combined.throwIfAborted();
-        const before = command.action === 'load' ? await assertCodex(host, agent, combined) : undefined;
         const generation = agent.session.surface.contentGeneration;
         const length = agent.session.surface.nodes.length;
         const stdout = await execute(command.action === 'list' ? ['list'] : command.argv, {
@@ -65,13 +54,12 @@ export function createKbHandler(host: KbHost, execute: KbExecutor) {
         });
         combined.throwIfAborted();
         if (command.action === 'list') return { kind: 'success', text: stdout.trim() || '登録済みKBはありません。' };
-        const after = await assertCodex(host, agent, combined);
-        if (generation !== agent.session.surface.contentGeneration || length !== agent.session.surface.nodes.length || before?.provider !== after.provider || before?.model !== after.model) {
-          throw new KbCommandError('読み込み中に会話またはモデルが変わったため適用しませんでした。もう一度 /kb を実行してください。');
+        if (generation !== agent.session.surface.contentGeneration || length !== agent.session.surface.nodes.length) {
+          throw new KbCommandError('読み込み中に会話が変わったため適用しませんでした。もう一度 /kb を実行してください。');
         }
         let snapshot;
         try { snapshot = validateSnapshot(JSON.parse(stdout)); }
-        catch { throw new KbCommandError('kb exportの形式が不正です。version 1の暗号化KBが必要です。'); }
+        catch { throw new KbCommandError('kb export --decrypted の出力が不正です。復号済みKBに対応したkbが必要です。'); }
         const message = createInsertion(snapshot);
         combined.throwIfAborted();
         let sourceEventSeq;
@@ -83,7 +71,7 @@ export function createKbHandler(host: KbHost, execute: KbExecutor) {
         }
         inserted = true;
         if (await host.flush(agent.session) === false) throw new KbCommandError('永続化サービスが利用できません。');
-        return { kind: 'success', text: `KB「${snapshot.name}」を${sourceEventSeq === undefined ? '次の入力時に挿入するため保存' : '現在の会話位置へ挿入'}しました。以後は通常の圧縮対象です。`,
+        return { kind: 'success', text: `KB「${snapshot.name}」を${sourceEventSeq === undefined ? '次の入力時に挿入するため保存' : '現在の会話位置へ挿入'}しました（復号済み本文 ${snapshot.text.length.toLocaleString('en-US')}字）。以後は通常の圧縮対象です。`,
           ...(sourceEventSeq === undefined ? {} : { sourceEventSeq }) };
       });
     } catch (error) {

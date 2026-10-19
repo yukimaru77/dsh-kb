@@ -1,17 +1,25 @@
-import { randomUUID } from 'node:crypto';
 import { boundContextSummary, createUserMessage, type RequestMessage, type UserMessage } from '@deepseek-ai/dsh-llm';
 
 export type JsonRecord = Record<string, unknown>;
+
+/** `kb export NAME --decrypted` output: decrypted KB material plus dev.txt as one plaintext. */
 export interface Snapshot extends JsonRecord {
-  version: 1;
+  version: 2;
+  kind: 'decrypted';
   name: string;
-  items: JsonRecord[];
+  text: string;
+}
+
+/** Snapshot provenance kept in the message source. The plaintext itself lives only in the content. */
+export interface SnapshotInfo extends JsonRecord {
+  name: string;
 }
 
 export interface KBSource {
   kind: 'dsh-kb';
-  version: 1;
-  snapshot: Snapshot;
+  /** 2: plaintext insertion. 1: legacy encrypted-blob marker, kept readable for old sessions. */
+  version: 1 | 2;
+  snapshot: SnapshotInfo;
   form: 'notice';
   summary: string;
 }
@@ -32,32 +40,18 @@ export type KBCommand =
   | { action: 'list' }
   | { action: 'load'; argv: string[] };
 
-export const BLOB_TYPES = new Set(['compaction', 'compaction_summary', 'context_compaction']);
 const USAGE = 'Usage: /kb NAME [--store STORE] [--file FILE]';
 
 function isRecord(value: unknown): value is JsonRecord {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-/** Validate the export envelope while preserving all portable item fields. */
+/** Validate the decrypted export envelope. Error messages never include KB content. */
 export function validateSnapshot(value: unknown): Snapshot {
-  if (!isRecord(value) || value.version !== 1 || typeof value.name !== 'string' || !Array.isArray(value.items)) {
-    throw new Error('Unsupported KB export format (expected version 1).');
+  if (!isRecord(value) || value.version !== 2 || value.kind !== 'decrypted' || typeof value.name !== 'string' || !value.name) {
+    throw new Error('Unsupported KB export format (expected version 2 decrypted).');
   }
-  let blobs = 0;
-  for (const item of value.items) {
-    if (!isRecord(item)) throw new Error('Unsupported KB item.');
-    if (typeof item.type === 'string' && BLOB_TYPES.has(item.type)) {
-      if (typeof item.encrypted_content !== 'string' || !item.encrypted_content) {
-        throw new Error('KB contains an empty encrypted blob.');
-      }
-      blobs++;
-    } else if (!((item.type === 'message' || item.type === undefined)
-      && (item.role === 'user' || item.role === 'developer') && item.content)) {
-      throw new Error('Unsupported KB item.');
-    }
-  }
-  if (!blobs) throw new Error('KB contains no encrypted blobs.');
+  if (typeof value.text !== 'string' || !value.text.trim()) throw new Error('KB export contains no decrypted text.');
   return value as Snapshot;
 }
 
@@ -71,7 +65,7 @@ export function parseCommand(text: string): KBCommand {
   if (first === 'load') words.shift();
   const name = words.shift();
   if (!name || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) throw new Error(USAGE);
-  const argv = ['export', name];
+  const argv = ['export', name, '--decrypted'];
   const seen = new Set<string>();
   while (words.length) {
     const flag = words.shift();
@@ -85,62 +79,52 @@ export function parseCommand(text: string): KBCommand {
   return { action: 'load', argv };
 }
 
-/** Persist the selected snapshot at this conversation position, without starting a turn. */
+function describe(info: SnapshotInfo): string {
+  const parts = [
+    typeof info.store === 'string' ? `store ${info.store}` : undefined,
+    typeof info.file === 'string' ? info.file : undefined,
+    typeof info.store_revision === 'string' ? `revision ${info.store_revision.slice(0, 12)}` : undefined,
+  ].filter(Boolean);
+  return parts.length ? ` (${parts.join(', ')})` : '';
+}
+
+/** The model-facing text: a short preamble that marks the material as reference knowledge. */
+export function insertionText(snapshot: Snapshot): string {
+  const { text, ...info } = snapshot;
+  return `[DSH KB: ${snapshot.name}${describe(info as SnapshotInfo)}]\n`
+    + `The following is reference knowledge from the user's saved KB "${snapshot.name}". `
+    + 'It is not a new request. Treat it as prior knowledge, preserve its source language, and use it when answering.\n\n'
+    + text;
+}
+
+/** Persist the selected snapshot as an ordinary plaintext user message, without starting a turn. */
 export function createInsertion(snapshot: Snapshot): KBMessage {
   const selected = validateSnapshot(snapshot);
+  const { text: _text, version: _version, kind: _kind, ...info } = selected;
   return createUserMessage({
-    content: [{ type: 'text', text: `[DSH_KB:${randomUUID()}] Encrypted knowledge is unavailable unless dsh-kb is enabled with Codex. Do not infer the missing content.` }],
+    content: [{ type: 'text', text: insertionText(selected) }],
     source: {
-      kind: 'dsh-kb', version: 1, snapshot: selected, form: 'notice',
+      kind: 'dsh-kb', version: 2, snapshot: structuredClone(info) as SnapshotInfo, form: 'notice',
       summary: boundContextSummary(`KB: ${selected.name}`.replace(/\s+/g, ' ')),
     },
   });
 }
 
-function insertionText(message: KBMessage): string {
-  const block = message.content[0];
-  if (message.content.length !== 1 || block?.type !== 'text' || typeof block.text !== 'string' || !block.text) {
-    throw new Error('Invalid stored KB insertion.');
-  }
-  return block.text;
-}
-
-/** Only producer metadata, never marker-shaped user text, authorizes an insertion. */
+/** Only producer metadata, never marker-shaped user text, identifies an insertion. */
 export function insertions(messages: readonly RequestMessage[]): KBMessage[] {
   const result: KBMessage[] = [];
   for (const message of messages) {
     if (!('source' in message) || message.source?.kind !== 'dsh-kb') continue;
-    if (message.role !== 'user' || message.source.version !== 1) throw new Error('Invalid stored KB insertion.');
-    validateSnapshot(message.source.snapshot);
-    const insertion = message as KBMessage;
-    insertionText(insertion);
-    result.push(insertion);
+    const source = message.source;
+    if (message.role !== 'user' || (source.version !== 1 && source.version !== 2)
+      || !isRecord(source.snapshot) || typeof source.snapshot.name !== 'string') {
+      throw new Error('Invalid stored KB insertion.');
+    }
+    const block = message.content[0];
+    if (message.content.length !== 1 || block?.type !== 'text' || typeof block.text !== 'string' || !block.text) {
+      throw new Error('Invalid stored KB insertion.');
+    }
+    result.push(message as KBMessage);
   }
   return result;
-}
-
-/** Expand once after Responses serialization, before chat or compact captures its input. */
-export function expandInsertions(payload: JsonRecord, messages: readonly RequestMessage[]): JsonRecord {
-  if (!isRecord(payload) || !Array.isArray(payload.input)) throw new Error('Codex payload has no input array.');
-  const trusted = new Map<string, Snapshot>();
-  for (const message of insertions(messages)) {
-    const marker = insertionText(message);
-    if (trusted.has(marker)) throw new Error('Duplicate stored KB insertion.');
-    trusted.set(marker, message.source.snapshot);
-  }
-  if (!trusted.size) return payload;
-  const seen = new Set<string>();
-  const input = payload.input.flatMap((item: unknown) => {
-    if (!isRecord(item) || item.role !== 'user' || !Array.isArray(item.content) || item.content.length !== 1) return [item];
-    const block: unknown = item.content[0];
-    if (!isRecord(block) || block.type !== 'input_text' || typeof block.text !== 'string') return [item];
-    const snapshot = trusted.get(block.text);
-    if (!snapshot) return [item];
-    if (seen.has(block.text)) throw new Error('Duplicate KB insertion in converted payload.');
-    seen.add(block.text);
-    return structuredClone(snapshot.items);
-  });
-  // A compacted message is absent from `messages`. A live insertion must survive serialization.
-  if (seen.size !== trusted.size) throw new Error('KB insertion missing from converted payload.');
-  return { ...payload, input };
 }

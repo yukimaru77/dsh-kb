@@ -22,10 +22,8 @@ for (const profileName of ['dsh-tui', 'web']) {
     await writeFile(join(profile, 'package.json'), JSON.stringify(manifest));
     await writeFile(join(profile, 'cordis.patch.yml'), '[]\n');
     await cp(join(source, 'node_modules'), join(profile, 'node_modules'), { recursive: true, dereference: false, verbatimSymlinks: true });
-    const snapshot = { version: 1, name: 'fixture', items: [
-      { type: 'compaction', encrypted_content: 'synthetic-not-valid-for-real-api', extra: { preserved: true } },
-      { role: 'developer', content: 'synthetic dev.txt' },
-    ] };
+    const snapshot = { version: 2, kind: 'decrypted', name: 'fixture', store: 'fixture-store', file: 'latest.json',
+      text: '## Decrypted KB material: fixture/decrypt/latest/01/raw.txt\n\nsynthetic decrypted body\n\n## KB developer notes\n\nsynthetic dev.txt\n' };
     const fixtureCli = join(scratch, 'kb-fixture');
     await writeFile(fixtureCli, `#!${process.execPath}\nconsole.log(process.argv[2] === 'list' ? 'fixture' : ${JSON.stringify(JSON.stringify(snapshot))});\n`, { mode: 0o700 });
     const credential = { type: 'oauth', access: 'x.' + Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'fixture-only' } })).toString('base64url') + '.x', refresh: 'fixture-only', expires: Date.now() + 3600000, accountId: 'fixture-only' };

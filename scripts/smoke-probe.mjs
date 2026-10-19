@@ -20,20 +20,21 @@ async function run(ctx) {
     assert.equal(agent.status, 'idle');
     assert.equal(agent.inbox.nextStep.length, 2);
     const payload = await ctx.piCompat.adapter.nativeRequest({ messages: agent.inbox.nextStep }, agent);
-    assert.equal(payload.payload.input.filter(item => item.encrypted_content).length, 2);
-    assert.equal(payload.payload.input.filter(item => item.role === 'developer').length, 2);
-    assert(payload.payload.input.filter(item => item.encrypted_content).every(item => item.extra.preserved));
+    const kb = payload.payload.input.filter(item => item.role === 'user' && JSON.stringify(item).includes('synthetic decrypted body'));
+    assert.equal(kb.length, 2);
+    assert(kb.every(item => item.content[0].type === 'input_text' && item.content[0].text.startsWith('[DSH KB: fixture')));
+    assert(!JSON.stringify(payload.payload.input).includes('encrypted_content'));
     assert.match((await command('/kb status')).result.text, /fixture → fixture/);
     assert.equal((await command('/kb off')).result.kind, 'success');
     assert.equal(agent.inbox.nextStep.length, 2);
-    // A UI route switch is prompt-scoped and may precede the next durable request header.
+    // Plaintext KB does not depend on the selected provider.
     const resetModel = agent.ctx.on('system-prompt/assemble', async (_assembly, _context, next) => {
       const assembly = await next();
       return { ...assembly, variables: { ...assembly.variables, provider: 'foreign', model: 'fixture' } };
     });
-    assert.equal((await command('/kb fixture')).result.kind, 'error');
-    assert.equal(agent.inbox.nextStep.length, 2);
+    assert.equal((await command('/kb fixture')).result.kind, 'success');
+    assert.equal(agent.inbox.nextStep.length, 3);
     resetModel();
-    console.log('DSH_KB_SMOKE_OK', process.env.DSH_KB_SMOKE_PROFILE, 'commands, durable queued inserts, Codex serialization, and compaction input');
+    console.log('DSH_KB_SMOKE_OK', process.env.DSH_KB_SMOKE_PROFILE, 'commands, durable queued plaintext inserts, Codex serialization');
   } finally { await handle.dispose(); }
 }

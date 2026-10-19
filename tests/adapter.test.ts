@@ -9,21 +9,15 @@ import { CodexPool } from '../node_modules/dsh-pi-compat/src/auth/pool.ts';
 import { PooledCodexAdapter } from '../node_modules/dsh-pi-compat/src/provider.ts';
 import { ServiceTierSettingsHelper } from '../node_modules/dsh-pi-compat/src/tier/index.ts';
 import { requestNativeCompaction } from '../node_modules/dsh-pi-compat/src/compact/transport.ts';
-import { createInsertion, expandInsertions, type JsonRecord, type Snapshot } from '../src/core.ts';
+import { createInsertion, type JsonRecord, type Snapshot } from "../src/core.ts";
 
 const user = (text: string) => createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text }] });
 const sse = (events: unknown[]) => new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''), {
   headers: { 'content-type': 'text/event-stream' },
 });
 const snapshot = (): Snapshot => ({
-  version: 1, name: 'adapter-fixture', store: 'synthetic-store', revision: 'synthetic-revision',
-  items: [
-    { type: 'compaction', id: 'kb-first', encrypted_content: 'synthetic-kb-blob-one', unknown: { nested: [1, false, null] } },
-    { type: 'compaction_summary', encrypted_content: 'synthetic-kb-blob-two', future_field: 'keep verbatim' },
-    { type: 'context_compaction', encrypted_content: 'synthetic-kb-blob-three', future_number: 42 },
-    { role: 'user', content: [{ type: 'input_text', text: 'Synthetic KB map.', unknown_part: true }], unknown_map: { revision: 2 } },
-    { type: 'message', role: 'developer', content: [{ type: 'input_text', text: '# dev.txt\nSynthetic developer instructions.' }], unknown_developer: ['keep', 'order'] },
-  ],
+  version: 2, kind: "decrypted", name: "adapter-fixture", store: "synthetic-store", store_revision: "synthetic-revision", file: "latest.json",
+  text: "## Decrypted KB material: adapter-fixture/decrypt/latest/01/raw.txt\n\nSynthetic KB map.\n\n## KB developer notes\n\n# dev.txt\nSynthetic developer instructions.\n",
 });
 
 function fixture(t: TestContext) {
@@ -43,7 +37,6 @@ function fixture(t: TestContext) {
   });
   t.mock.method(globalThis, 'fetch', async () => { throw new Error('Real network forbidden'); });
   const adapter = new PooledCodexAdapter(new Context(), broker, new ServiceTierSettingsHelper({ 'openai-codex': 'priority' }));
-  t.after(adapter.registerPayloadTransform('dsh-kb', (payload, request) => expandInsertions(payload, request.messages)));
   const model = broker.catalog.getModels('openai-codex').find(model => model.id === 'gpt-6-luna');
   assert.ok(model, 'the pinned catalog contains gpt-6-luna');
   const insertion = createInsertion(snapshot());
@@ -57,20 +50,23 @@ function fixture(t: TestContext) {
   return { adapter, model, agent, insertion, messages, authCalls: () => authCalls };
 }
 
-function assertExpanded(payload: JsonRecord, selected: Snapshot): void {
-  assert.equal(payload.instructions, 'Synthetic system instructions.');
-  assert.equal(payload.service_tier, 'priority');
+function assertPlain(payload: JsonRecord, selected: Snapshot): void {
+  assert.equal(payload.instructions, "Synthetic system instructions.");
+  assert.equal(payload.service_tier, "priority");
   const input = payload.input as JsonRecord[];
-  assert.equal(input.length, selected.items.length + 2);
-  assert.equal(input[0].role, 'user');
-  assert.deepEqual(input[0].content, [{ type: 'input_text', text: 'Before KB.' }]);
-  assert.deepEqual(input.slice(1, -1), selected.items, 'all blobs, dev.txt and unknown fields retain their exact order and values');
-  assert.equal(input.at(-1)!.role, 'user');
-  assert.deepEqual(input.at(-1)!.content, [{ type: 'input_text', text: 'After KB.' }]);
-  assert.ok(!JSON.stringify(payload).includes('[DSH_KB:'), 'only the serialized marker is replaced');
+  assert.equal(input.length, 3, "the KB is one ordinary message between its neighbours");
+  assert.deepEqual(input[0].content, [{ type: "input_text", text: "Before KB." }]);
+  assert.equal(input[1].role, "user");
+  const content = input[1].content as JsonRecord[];
+  assert.equal(content.length, 1);
+  assert.equal(content[0].type, "input_text");
+  assert.match(String(content[0].text), /^\[DSH KB: adapter-fixture/);
+  assert.ok(String(content[0].text).endsWith(selected.text));
+  assert.deepEqual(input.at(-1)!.content, [{ type: "input_text", text: "After KB." }]);
+  assert.ok(!JSON.stringify(input).includes("encrypted_content"), "no blob is sent");
 }
 
-test('Codex stream expands stored KB at its original position without changing DSH messages', async t => {
+test('Codex stream sends stored KB as plaintext at its original position without changing DSH messages', async t => {
   const f = fixture(t);
   const before = structuredClone(f.messages);
   const sent: JsonRecord[] = [];
@@ -90,34 +86,34 @@ test('Codex stream expands stored KB at its original position without changing D
     assert.deepEqual(chunks.find(chunk => chunk.type === 'finish')?.reason, { kind: 'stop' });
   };
   await stream(f.messages);
-  assertExpanded(sent[0], f.insertion.source.snapshot);
+  assertPlain(sent[0], snapshot());
   assert.deepEqual(f.messages, before);
   const afterCompaction = [f.messages[0], user('Retained summary without a KB marker.'), f.messages.at(-1)!];
   await stream(afterCompaction);
-  assert.ok(!JSON.stringify(sent[1]).includes('synthetic-kb-blob'));
+  assert.ok(!JSON.stringify(sent[1]).includes('Synthetic KB map.'));
   assert.ok(!JSON.stringify(sent[1]).includes('Synthetic developer instructions.'));
   assert.deepEqual(f.messages, before);
   assert.equal(f.authCalls(), 2);
 });
 
-test('nativeRequest expands only its selected compaction messages, never old session insertions', async t => {
+test('nativeRequest serializes only its selected compaction messages, never old session insertions', async t => {
   const f = fixture(t);
   const before = structuredClone(f.messages);
   const request = await f.adapter.nativeRequest({ messages: f.messages }, f.agent);
   assert.ok(request);
-  assertExpanded(request.payload, f.insertion.source.snapshot);
+  assertPlain(request.payload, snapshot());
   assert.deepEqual(f.messages, before);
   const afterCompaction = [f.messages[0], user('Retained summary without a KB marker.'), f.messages.at(-1)!];
   const next = await f.adapter.nativeRequest({ messages: afterCompaction }, f.agent);
   assert.ok(next);
-  assert.ok(!JSON.stringify(next.payload).includes('synthetic-kb-blob'));
+  assert.ok(!JSON.stringify(next.payload).includes('Synthetic KB map.'));
   assert.ok(!JSON.stringify(next.payload).includes('Synthetic developer instructions.'));
   assert.equal((next.payload.input as JsonRecord[]).length, 2);
   assert.deepEqual(f.agent.session.deriveMessages(), before, 'the old session history still contains KB, but is outside this compact request');
   assert.equal(f.authCalls(), 0);
 });
 
-test('native compaction HTTP receives the expanded blobs and developer text before its trigger', async t => {
+test('native compaction HTTP receives the plaintext KB and developer notes before its trigger', async t => {
   const f = fixture(t);
   const originalMessages = structuredClone(f.messages);
   const request = await f.adapter.nativeRequest({ messages: f.messages }, f.agent);
@@ -133,7 +129,7 @@ test('native compaction HTTP receives the expanded blobs and developer text befo
       const body = JSON.parse(String(init?.body)) as JsonRecord;
       const input = body.input as JsonRecord[];
       assert.deepEqual(input.at(-1), { type: 'compaction_trigger' });
-      assertExpanded({ ...body, input: input.slice(0, -1) }, f.insertion.source.snapshot);
+      assertPlain({ ...body, input: input.slice(0, -1) }, snapshot());
       assert.deepEqual(input.slice(0, -1), originalPayload.input);
       return sse([
         { type: 'response.output_item.done', item: compacted },

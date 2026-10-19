@@ -10,7 +10,6 @@ if (!supplied || process.argv.length > 3) {
 }
 const compat = await realpath(resolve(supplied));
 await access(join(compat, 'lib/index.js'));
-await access(join(compat, 'src/payload.ts'));
 const links = new Map([['dsh-pi-compat', compat]]);
 for (const scope of ['@deepseek-ai', '@earendil-works', '@types']) {
   for (const name of await readdir(join(compat, 'node_modules', scope))) {

@@ -12,7 +12,7 @@ import { Session, SessionId, SessionLogOffset, SessionSeq, type SessionEvent, ty
 import { sessionFormatCatalog } from '@deepseek-ai/dsh-session-format-catalog';
 import type { SessionFormatEvent, SessionFormatHeader } from '@deepseek-ai/dsh-session-format';
 import { createKbHandler } from '../src/command.ts';
-import { expandInsertions, insertions, type JsonRecord, type Snapshot } from '../src/core.ts';
+import { insertions, type JsonRecord, type Snapshot } from '../src/core.ts';
 import { pendingInsertions, registerPending } from '../src/pending.ts';
 import type { ContentBlock, Message, TokenUsage, ToolSchema } from '@deepseek-ai/dsh-llm';
 
@@ -24,15 +24,13 @@ type SummaryResult = { summary: ContentBlock[]; provider: string; model: string;
 
 const route: LlmCallConfig = { provider: 'openai-codex', model: 'gpt-6-luna' };
 const user = (text: string) => createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text }] });
+const body = (name: string) => `${name} decrypted body`;
 const snapshot = (name = 'alpha'): Snapshot => ({
-  version: 1, name, store: 'fixture-store', store_revision: 'revision-one',
-  items: [
-    { type: 'compaction', encrypted_content: `opaque-${name}`, extra: { preserved: true } },
-    { type: 'message', role: 'developer', content: [{ type: 'input_text', text: `${name} developer instructions` }] },
-  ],
+  version: 2, kind: 'decrypted', name, store: 'fixture-store', store_revision: 'revision-one', file: 'latest.json',
+  text: `## Decrypted KB material: ${name}/decrypt/latest/01/raw.txt\n\n${body(name)}\n\n## KB developer notes\n\n${name} developer instructions\n`,
 });
 
-/** Minimal Responses input serialization, with no provider or network access. */
+/** Minimal Responses-like input serialization, with no provider or network access. */
 function wire(messages: readonly RequestMessage[]): JsonRecord {
   return { input: messages.map(message => ({
     role: message.role === 'system' ? 'developer' : message.role,
@@ -43,6 +41,7 @@ function wire(messages: readonly RequestMessage[]): JsonRecord {
 class CaptureAdapter extends LlmAdapter {
   readonly requests: RequestMessage[][] = [];
   readonly payloads: JsonRecord[] = [];
+  readonly providers: string[] = [];
   pause?: Promise<void>;
   entered?: () => void;
   override async resolveModel(provider: string, id: string): Promise<LlmResolvedModelInfo> {
@@ -50,7 +49,8 @@ class CaptureAdapter extends LlmAdapter {
   }
   override async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     this.requests.push(structuredClone(options.messages));
-    this.payloads.push(expandInsertions(wire(options.messages), options.messages));
+    this.payloads.push(wire(options.messages));
+    this.providers.push(options.provider);
     this.entered?.();
     await this.pause;
     yield { type: 'block-start', index: 0, blockType: 'text' };
@@ -60,23 +60,20 @@ class CaptureAdapter extends LlmAdapter {
 }
 
 let fixtureNumber = 0;
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, agentRoute: LlmCallConfig = route) {
   const ctx = new Context();
   await mountAgentLoopTestDependencies(ctx, { systemPrompt: { personaPrefix: 'Fixture system instructions.' } });
   registerPending(ctx);
   await ctx.plugin(AgentLoop, { agents: [] });
   const adapter = new CaptureAdapter();
   ctx.llm.registerAdapter(['openai-codex', 'foreign'], adapter);
-  const agent = await ctx.agentLoop.create(SessionId(`dsh-kb-integration-${++fixtureNumber}`), route, { cwd: '/synthetic/kb-workspace' });
+  const agent = await ctx.agentLoop.create(SessionId(`dsh-kb-integration-${++fixtureNumber}`), agentRoute, { cwd: '/synthetic/kb-workspace' });
   t.after(async () => { await ctx.fiber.dispose(); });
-  let selectedRoute: Partial<LlmCallConfig> = { ...route };
   const flushes: number[] = [];
   const host = {
-    routeFor: () => selectedRoute,
-    supportsModel: (id: string) => id === route.model,
     flush: async (session: Session) => { flushes.push(Number(session.seq)); await ctx.sessions.flush(session); },
   };
-  return { ctx, agent, adapter, host, flushes, setRoute: (next: Partial<LlmCallConfig>) => { selectedRoute = next; } };
+  return { ctx, agent, adapter, host, flushes };
 }
 
 function invocation(agent: Agent, rawInput: string, signal = new AbortController().signal): CommandInvocation {
@@ -115,38 +112,60 @@ function names(messages: readonly RequestMessage[]): string[] {
   return insertions(messages).map(message => message.source.snapshot.name);
 }
 
-test('fresh /kb persists pending knowledge without a turn, then admits it after the system head exactly once', async t => {
+/** Positions of payload items whose text contains the needle. */
+function positions(payload: JsonRecord, needle: string): number[] {
+  return (payload.input as JsonRecord[]).flatMap((item, index) => JSON.stringify(item).includes(needle) ? [index] : []);
+}
+
+test('fresh /kb persists pending plaintext without a turn, then admits it after the system head exactly once', async t => {
   const { agent, adapter, host, flushes } = await fixture(t);
   const exported = snapshot();
   let exports = 0;
   const handle = createKbHandler(host, async (argv, options) => {
     exports++;
-    assert.deepEqual(argv, ['export', 'alpha']);
+    assert.deepEqual(argv, ['export', 'alpha', '--decrypted']);
     assert.equal(options.cwd, '/synthetic/kb-workspace');
     return JSON.stringify(exported);
   });
-  assert.equal((await handle(invocation(agent, 'alpha'))).kind, 'success');
+  const result = await handle(invocation(agent, 'alpha'));
+  assert.equal(result.kind, 'success');
+  assert.match(result.text ?? '', /復号済み本文/);
   assert.equal(adapter.requests.length, 0);
   assert.equal(flushes.length, 1);
   assert.deepEqual(names(agent.inbox.nextStep), ['alpha']);
   assert.deepEqual(names(agent.session.deriveMessages()), []);
   const pending = restored(agent.session);
   assert.ok(pending.snapshotEvents().some(event => event.type === 'agent/inbox/spliced' && names(event.data.inserted).includes('alpha')));
-  exported.items[0].encrypted_content = 'changed-after-load';
+  exported.text = 'changed-after-load';
 
   await prompt(agent, 'use the knowledge');
   assert.equal(adapter.requests.length, 1);
   assert.deepEqual(names(adapter.requests[0]), ['alpha']);
   assert.equal(adapter.requests[0][0].role, 'system');
   assert.deepEqual(names(agent.inbox.nextStep), []);
-  const input = adapter.payloads[0].input as JsonRecord[];
-  assert.equal(input.filter(item => item.type === 'compaction').length, 1);
-  assert.equal(input.find(item => item.type === 'compaction')?.encrypted_content, 'opaque-alpha');
-  assert.ok(input.some(item => item.role === 'developer' && JSON.stringify(item).includes('alpha developer instructions')));
+  const payload = adapter.payloads[0];
+  assert.deepEqual(positions(payload, body('alpha')), [1], 'plaintext right after the system head');
+  const kb = (payload.input as JsonRecord[])[1];
+  assert.equal(kb.role, 'user');
+  assert.match(JSON.stringify(kb), /reference knowledge from the user's saved KB/);
+  assert.match(JSON.stringify(kb), /alpha developer instructions/);
+  assert.ok(!JSON.stringify(adapter.requests).includes('changed-after-load'));
+  assert.ok(!JSON.stringify(adapter.requests).includes('encrypted_content'));
   assert.deepEqual(names(restored(agent.session).deriveMessages()), ['alpha']);
   await prompt(agent, 'continue');
   assert.equal(exports, 1);
-  assert.equal((adapter.payloads[1].input as JsonRecord[]).filter(item => item.type === 'compaction').length, 1);
+  assert.equal(positions(adapter.payloads[1], body('alpha')).length, 1);
+});
+
+test('a non-Codex provider receives the same plaintext insertion', async t => {
+  const { agent, adapter, host } = await fixture(t, { provider: 'foreign', model: 'foreign' });
+  await prompt(agent, 'before');
+  const handle = createKbHandler(host, async () => JSON.stringify(snapshot()));
+  assert.equal((await handle(invocation(agent, 'alpha'))).kind, 'success');
+  await prompt(agent, 'after');
+  assert.deepEqual(adapter.providers, ['foreign', 'foreign']);
+  const [kb] = positions(adapter.payloads[1], body('alpha'));
+  assert.ok(kb < positions(adapter.payloads[1], 'after')[0]);
 });
 
 test('multiple /kb snapshots stay at their insertion positions through codec restoration and real fork', async t => {
@@ -161,17 +180,14 @@ test('multiple /kb snapshots stay at their insertion positions through codec res
   await prompt(agent, 'after beta');
   const messages = agent.session.deriveMessages();
   assert.deepEqual(names(messages), ['alpha', 'beta']);
-  const payload = expandInsertions(wire(messages), messages);
-  const input = payload.input as JsonRecord[];
-  const alpha = input.findIndex(item => item.encrypted_content === 'opaque-alpha');
-  const middle = input.findIndex(item => JSON.stringify(item).includes('between alpha and beta'));
-  const beta = input.findIndex(item => item.encrypted_content === 'opaque-beta');
+  const payload = wire(messages);
+  const [alpha] = positions(payload, body('alpha'));
+  const [middle] = positions(payload, 'between alpha and beta');
+  const [beta] = positions(payload, body('beta'));
   assert.ok(alpha >= 0 && alpha < middle && middle < beta);
-  const replay = restored(agent.session);
-  assert.deepEqual(expandInsertions(wire(replay.deriveMessages()), replay.deriveMessages()), payload);
+  assert.deepEqual(wire(restored(agent.session).deriveMessages()), payload);
   const child = ctx.sessions.fork(agent.session, undefined, SessionId(`kb-fork-${++fixtureNumber}`));
-  const forkReplay = restored(child);
-  assert.deepEqual(expandInsertions(wire(forkReplay.deriveMessages()), forkReplay.deriveMessages()), payload);
+  assert.deepEqual(wire(restored(child).deriveMessages()), payload);
 });
 
 test('pending KB survives codec hydration and fork, and cancellation cannot lose the saved selection', async t => {
@@ -224,14 +240,14 @@ test('first-turn KB survives actual disposal clearing, codec restoration, and ag
   assert.deepEqual(names(adapter.requests[0]), ['alpha']);
   assert.deepEqual(pendingInsertions(resumed.agent.session), []);
   await prompt(resumed.agent, 'second prompt');
-  assert.equal((adapter.payloads[1].input as JsonRecord[]).filter(item => item.type === 'compaction').length, 1);
+  assert.equal(positions(adapter.payloads[1], body('alpha')).length, 1);
   assert.equal(resumed.agent.session.snapshotEvents().filter(event => event.type === 'user/message' && event.data.source.kind === 'dsh-kb').length, 1);
 });
 
 class FixtureCompaction extends BasicCompactionEngine {
   readonly captured: JsonRecord[] = [];
   protected override async summarize(input: SummarizationInput): Promise<SummaryResult> {
-    this.captured.push(expandInsertions(wire(input.messages), input.messages));
+    this.captured.push(wire(input.messages));
     return { summary: [{ type: 'text', text: 'Retain the selected knowledge and prior task.' }], provider: route.provider, model: route.model };
   }
 }
@@ -250,15 +266,15 @@ test('real DSH compaction consumes active snapshots and never resurrects them fr
   const result = await ctx.compaction.compactNow(agent, new AbortController().signal);
   assert.ok(result);
   assert.ok(ctx.compaction instanceof FixtureCompaction);
-  assert.ok(JSON.stringify(ctx.compaction.captured).includes('opaque-alpha'));
+  assert.ok(JSON.stringify(ctx.compaction.captured).includes(body('alpha')), 'the summarizer sees the plaintext');
   assert.deepEqual(names(agent.session.deriveMessages()), []);
   assert.deepEqual(pendingInsertions(agent.session), []);
   assert.ok(agent.session.snapshotEvents().some(event => event.type === 'user/message' && event.data.source.kind === 'dsh-kb'));
   const replay = restored(agent.session);
   assert.deepEqual(names(replay.deriveMessages()), []);
-  assert.ok(!JSON.stringify(expandInsertions(wire(replay.deriveMessages()), replay.deriveMessages())).includes('opaque-alpha'));
+  assert.ok(!JSON.stringify(wire(replay.deriveMessages())).includes(body('alpha')));
   await prompt(agent, 'Continue after compaction.');
-  assert.ok(!JSON.stringify(adapter.payloads.at(-1)).includes('opaque-alpha'));
+  assert.ok(!JSON.stringify(adapter.payloads.at(-1)).includes(body('alpha')));
   const child = ctx.sessions.fork(agent.session, undefined, SessionId(`kb-compacted-fork-${++fixtureNumber}`));
   assert.deepEqual(names(restored(child).deriveMessages()), []);
 });
@@ -280,12 +296,11 @@ test('maintenance queues a concurrent prompt until the KB snapshot is committed 
   assert.equal(flushes.length, 1);
   assert.equal(adapter.requests.length, 2);
   assert.deepEqual(names(adapter.requests[1]), ['alpha']);
-  const input = adapter.payloads[1].input as JsonRecord[];
-  assert.ok(input.findIndex(item => item.type === 'compaction') < input.findIndex(item => JSON.stringify(item).includes('arrived during export')));
+  assert.ok(positions(adapter.payloads[1], body('alpha'))[0] < positions(adapter.payloads[1], 'arrived during export')[0]);
 });
 
-test('busy agents, route changes and cancellation cannot partially insert a KB', async t => {
-  const { agent, adapter, host, setRoute } = await fixture(t);
+test('busy agents, invalid exports, conversation changes and cancellation cannot partially insert a KB', async t => {
+  const { agent, adapter, host } = await fixture(t);
   await prompt(agent, 'establish history');
   let calls = 0;
   const handle = createKbHandler(host, async () => { calls++; return JSON.stringify(snapshot()); });
@@ -302,19 +317,24 @@ test('busy agents, route changes and cancellation cannot partially insert a KB',
   adapter.pause = undefined;
   adapter.entered = undefined;
 
-  for (const mode of ['route', 'abort'] as const) {
+  const legacy = createKbHandler(host, async () => JSON.stringify({ version: 1, name: 'alpha', items: [{ type: 'compaction', encrypted_content: 'opaque' }] }));
+  const rejected = await legacy(invocation(agent, 'alpha'));
+  assert.equal(rejected.kind, 'error');
+  assert.match(rejected.text, /--decrypted/);
+  assert.deepEqual(names(agent.session.deriveMessages()), []);
+
+  for (const mode of ['history', 'abort'] as const) {
     const exporting = deferred();
     const done = deferred();
     const controller = new AbortController();
     const delayed = createKbHandler(host, async () => { exporting.resolve(); await done.promise; return JSON.stringify(snapshot()); });
     const loading = delayed(invocation(agent, 'alpha', controller.signal));
     await exporting.promise;
-    if (mode === 'route') setRoute({ provider: 'foreign', model: 'foreign' });
+    if (mode === 'history') agent.session.append('user/message', user('changed while exporting'), { surfaceOp: 'append' });
     else controller.abort(new Error('fixture cancelled'));
     done.resolve();
     assert.equal((await loading).kind, 'error');
     assert.deepEqual(names(agent.session.deriveMessages()), []);
     assert.deepEqual(names(agent.inbox.nextStep), []);
-    setRoute({ ...route });
   }
 });

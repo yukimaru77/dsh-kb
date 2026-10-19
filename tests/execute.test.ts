@@ -11,6 +11,19 @@ test('CLI failures never expose captured KB stdout or stderr', async () => {
     return true;
   });
 });
+test('known kb failures map to fixed guidance without echoing stderr', async () => {
+  const run = executor(process.execPath);
+  const options = { cwd: process.cwd(), signal: new AbortController().signal };
+  const fail = (stderr: string) => run(['-e', `console.error(${JSON.stringify(stderr)}); process.exit(1)`], options);
+  await assert.rejects(fail('kb: 復号済みKBがありません: PRIVATE/latest.json。先に `kb decrypt` を実行してください'), error => {
+    assert(error instanceof KbCommandError);
+    assert.match(error.message, /復号済みの本文がありません/);
+    assert(!error.message.includes('PRIVATE'));
+    return true;
+  });
+  await assert.rejects(fail('kb: KBが見つかりません: PRIVATE / latest.json'), /指定したKBが見つかりません/);
+  await assert.rejects(fail('kb: error: unrecognized arguments: --decrypted'), /--decrypted に未対応/);
+});
 test('CLI arguments are passed literally and execution is cancellable', async () => {
   const run = executor(process.execPath);
   const literal = '$(printf unintended); spaces';
