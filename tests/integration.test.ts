@@ -6,7 +6,6 @@ import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-test
 import type { Agent } from '@deepseek-ai/dsh-agent';
 import { CommandId, type CommandInvocation } from '@deepseek-ai/dsh-commands';
 import { BasicCompactionEngine } from '@deepseek-ai/dsh-compaction-basic';
-import type { SummarizationInput, SummaryResult } from '@deepseek-ai/dsh-compaction-basic/src/summarizer.ts';
 import TokenMeter from '@deepseek-ai/dsh-token-meter';
 import { createUserMessage, LlmAdapter, type GenerateOptions, type LlmCallConfig, type LlmResolvedModelInfo, type RequestMessage, type StreamChunk } from '@deepseek-ai/dsh-llm';
 import { Session, SessionId, SessionLogOffset, SessionSeq, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session';
@@ -15,6 +14,13 @@ import type { SessionFormatEvent, SessionFormatHeader } from '@deepseek-ai/dsh-s
 import { createKbHandler } from '../src/command.ts';
 import { expandInsertions, insertions, type JsonRecord, type Snapshot } from '../src/core.ts';
 import { pendingInsertions, registerPending } from '../src/pending.ts';
+import type { ContentBlock, Message, TokenUsage, ToolSchema } from '@deepseek-ai/dsh-llm';
+
+// The summarize-hook shapes of @deepseek-ai/dsh-compaction-basic 0.2.1-rc.2. The released
+// package ships them only below lib/types, which its exports map does not expose.
+interface SummarizationInput { readonly tools?: readonly ToolSchema[]; readonly messages: readonly Message[] }
+type SummaryResult = { summary: ContentBlock[]; provider: string; model: string; maxTokens?: number; usage?: TokenUsage }
+  & ({ rawOutput: ContentBlock[]; llmStreamCall: true } | { rawOutput?: ContentBlock[]; llmStreamCall?: never });
 
 const route: LlmCallConfig = { provider: 'openai-codex', model: 'gpt-6-luna' };
 const user = (text: string) => createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text }] });
